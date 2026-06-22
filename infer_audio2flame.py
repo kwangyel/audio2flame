@@ -3,9 +3,8 @@ Audio2FLAME inference.
 
 Runs a trained model on a new WAV and produces driving FLAME parameters:
 
-  - exp[100] + jaw[6] are predicted from audio (overlap-add over windows),
-  - eyes[12] (gaze) and eyelids[2] (blink) are added procedurally, since they
-    do not track audio,
+  - exp[100] + eyelids[2] + jaw[6] are predicted from audio (overlap-add over windows),
+  - eyes[12] (gaze) are added procedurally or copied from reference,
   - shape/tex/sh and camera/opencv metadata are copied from a reference .frame.
 
 Outputs per-frame .frame files (drop-in for the metrical-tracker format used to
@@ -20,28 +19,13 @@ Example:
 import argparse
 import copy
 import os
-import pickle
 
 import numpy as np
 import torch
 
-from model import Audio2Flame
+from data import load_frame, to_numpy
+from model import Audio2Flame, EYELID_DIM, EXPR_DIM, JAW_DIM
 from train_audio2flame import SR, load_audio, normalize_waveform, samples_for_frames
-
-
-def load_frame(path):
-    try:
-        data = torch.load(path, map_location="cpu", weights_only=False)
-    except Exception:
-        with open(path, "rb") as f:
-            data = pickle.load(f)
-    return data
-
-
-def to_numpy(x):
-    if hasattr(x, "detach"):
-        return x.detach().cpu().numpy()
-    return np.asarray(x)
 
 
 # ---------------------------------------------------------------------------
@@ -84,19 +68,6 @@ def predict_full(model, wav, n_frames, fps, out_dim, win_frames, overlap, device
 # ---------------------------------------------------------------------------
 # Procedural eyes
 # ---------------------------------------------------------------------------
-def make_blink_track(n_frames, fps, amp, rng, min_gap=2.0, max_gap=6.0, dur=0.18):
-    track = np.zeros(n_frames, dtype=np.float32)
-    blink_len = max(2, int(round(dur * fps)))
-    t = int(rng.uniform(min_gap, max_gap) * fps)
-    while t < n_frames:
-        for i in range(blink_len):
-            if t + i < n_frames:
-                phase = i / (blink_len - 1)
-                track[t + i] = amp * 0.5 * (1.0 - np.cos(2.0 * np.pi * phase))
-        t += blink_len + int(rng.uniform(min_gap, max_gap) * fps)
-    return track
-
-
 def make_gaze_drift(n_frames, dim, amp, fps, rng, smooth_sec=0.5):
     if amp <= 0:
         return np.zeros((n_frames, dim), dtype=np.float32)
@@ -120,22 +91,28 @@ def main(args):
     stats = np.load(args.stats)
     mean = stats["mean"].astype(np.float32)
     std = stats["std"].astype(np.float32)
-    expr_dim = int(stats["expr_dim"])
+    expr_dim = int(stats.get("expr_dim", EXPR_DIM))
+    eyelid_dim = int(stats.get("eyelid_dim", EYELID_DIM))
+    jaw_dim = int(stats.get("jaw_dim", JAW_DIM))
     fps = int(args.fps if args.fps else int(stats["fps"]))
     out_dim = mean.shape[0]
-    jaw_dim = out_dim - expr_dim
+    jaw_start = expr_dim + eyelid_dim
 
     ckpt = torch.load(args.ckpt, map_location="cpu")
     margs = ckpt.get("args", {})
     model = Audio2Flame(
         out_dim=ckpt.get("out_dim", out_dim),
-        d_model=margs.get("d_model", args.d_model),
-        n_layers=margs.get("n_layers", args.n_layers),
+        bilstm_hidden=margs.get("bilstm_hidden", args.bilstm_hidden),
+        bilstm_layers=margs.get("bilstm_layers", args.bilstm_layers),
+        mlp_hidden=margs.get("mlp_hidden", args.mlp_hidden),
+        dropout=margs.get("dropout", args.dropout),
         w2v_name=margs.get("w2v_name", args.w2v_name),
-        freeze_feature_extractor=True,
     ).to(device)
     model.load_state_dict(ckpt["model"])
-    print(f"Loaded checkpoint {args.ckpt} (out_dim={out_dim}, expr_dim={expr_dim})")
+    print(
+        f"Loaded checkpoint {args.ckpt} (out_dim={out_dim}, "
+        f"expr={expr_dim}, eyelids={eyelid_dim}, jaw={jaw_dim})"
+    )
 
     wav = load_audio(args.audio, SR)
     n_frames = int(round(wav.shape[0] / SR * fps))
@@ -146,42 +123,39 @@ def main(args):
     pred_norm = predict_full(model, wav, n_frames, fps, out_dim, win_frames, overlap, device)
     pred = pred_norm * std + mean                      # un-normalize -> [n_frames, out_dim]
 
-    pred_exp = pred[:, :expr_dim].astype(np.float32)   # [n, 100]
-    pred_jaw = pred[:, expr_dim:].astype(np.float32)   # [n, 6]
+    pred_exp = pred[:, :expr_dim].astype(np.float32)
+    pred_eyelids = pred[:, expr_dim:jaw_start].astype(np.float32)
+    pred_jaw = pred[:, jaw_start:].astype(np.float32)
 
     # --- reference frame for identity/appearance + neutral eyes ---
     ref = load_frame(args.ref_frame)
     is_nested = isinstance(ref.get("flame", None), dict)
     ref_flame = ref["flame"] if is_nested else ref
     ref_eyes = to_numpy(ref_flame["eyes"]).reshape(-1).astype(np.float32)
-    ref_eyelids = to_numpy(ref_flame["eyelids"]).reshape(-1).astype(np.float32)
     eyes_dim = ref_eyes.shape[0]
-    eyelids_dim = ref_eyelids.shape[0]
 
-    # --- procedural eyes ---
+    # --- procedural gaze (optional) ---
     rng = np.random.default_rng(args.seed)
-    blink = make_blink_track(n_frames, fps, args.blink_amp, rng)          # [n]
-    gaze = make_gaze_drift(n_frames, eyes_dim, args.gaze_amp, fps, rng)   # [n, eyes_dim]
+    gaze = make_gaze_drift(n_frames, eyes_dim, args.gaze_amp, fps, rng)
 
     os.makedirs(args.out_dir, exist_ok=True)
-    combined = {"exp": pred_exp, "jaw": pred_jaw}
-    np.savez(os.path.join(args.out_dir, "predicted_params.npz"), **combined)
+    np.savez(
+        os.path.join(args.out_dir, "predicted_params.npz"),
+        exp=pred_exp,
+        eyelids=pred_eyelids,
+        jaw=pred_jaw,
+    )
 
     for i in range(n_frames):
         frame = copy.deepcopy(ref)
         flame = frame["flame"] if is_nested else frame
 
         flame["exp"] = pred_exp[i][None, :]
+        flame["eyelids"] = pred_eyelids[i][None, :].astype(np.float32)
         flame["jaw"] = pred_jaw[i][None, :]
 
         eyes_i = ref_eyes + gaze[i]
         flame["eyes"] = eyes_i[None, :].astype(np.float32)
-
-        eyelids_i = ref_eyelids.copy()
-        eyelids_i[: min(eyelids_dim, 2)] = (
-            ref_eyelids[: min(eyelids_dim, 2)] + blink[i]
-        )
-        flame["eyelids"] = eyelids_i[None, :].astype(np.float32)
 
         if "frame_id" in frame:
             frame["frame_id"] = f"{i:05d}"
@@ -201,16 +175,15 @@ def parse_args():
     p.add_argument("--fps", type=int, default=0, help="0 = use fps stored in stats")
     p.add_argument("--win_sec", type=float, default=4.0)
     p.add_argument("--overlap_sec", type=float, default=1.0)
-    # procedural eyes
-    p.add_argument("--blink_amp", type=float, default=1.0,
-                   help="Eyelid-close amplitude; tune to your tracker's eyelid scale")
     p.add_argument("--gaze_amp", type=float, default=0.0,
                    help="Subtle idle gaze drift amplitude (0 disables)")
     p.add_argument("--seed", type=int, default=0)
     # fallbacks if checkpoint lacks args
     p.add_argument("--w2v_name", default="facebook/wav2vec2-base-960h")
-    p.add_argument("--d_model", type=int, default=512)
-    p.add_argument("--n_layers", type=int, default=6)
+    p.add_argument("--bilstm_hidden", type=int, default=256)
+    p.add_argument("--bilstm_layers", type=int, default=2)
+    p.add_argument("--mlp_hidden", type=int, default=256)
+    p.add_argument("--dropout", type=float, default=0.1)
     return p.parse_args()
 
 

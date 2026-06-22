@@ -1,26 +1,24 @@
 """
 Per-subject Audio2FLAME training.
 
-Fine-tunes Wav2Vec2 end-to-end and regresses FLAME exp[100] + jaw[6] from raw
-audio. Trains on short windows of a single subject's synchronized
-(audio, FLAME-tracking) recording.
+Regresses FLAME exp[100] + eyelids[2] + jaw[6] from raw audio using a frozen
+Wav2Vec2 encoder, 2-layer BiLSTM, and MLP head. Trains on short windows of a
+single subject's synchronized (audio, FLAME-tracking) recording.
 
 Inputs:
   --audio       a single WAV synced to frame 0 of the tracking
-  --expr        expressions_x.npy  -> [T, 100]
-  --jaw         jaw_x.npy          -> [T, 6]
+  --frames_dir  directory of Metrical .frame files (preferred)
+  or --expr / --eyelids / --jaw npy files
 
 Outputs:
   audio2flame_best.pth   best checkpoint (by temporal validation loss)
   flame_stats.npz        per-channel target mean/std (for un-normalization)
 
 Example:
-  python train_audio2flame.py --audio subject.wav --expr expressions_x.npy \
-      --jaw jaw_x.npy --fps 30 --epochs 100 --batch_size 8
+  python train_audio2flame.py --audio subject.wav --frames_dir combined/ --fps 30
 """
 
 import argparse
-import os
 
 import numpy as np
 import torch
@@ -28,7 +26,8 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from model import Audio2Flame, SmoothFlameLoss
+from data import build_targets_from_npy, load_targets_from_frames
+from model import Audio2Flame, EYELID_DIM, EXPR_DIM, JAW_DIM, SmoothFlameLoss
 
 SR = 16000
 
@@ -97,16 +96,15 @@ class Audio2FlameWindows(Dataset):
 # ---------------------------------------------------------------------------
 # Data preparation
 # ---------------------------------------------------------------------------
-def build_targets(expr_path: str, jaw_path: str) -> np.ndarray:
-    expr = np.load(expr_path).astype(np.float32)   # [T, 100]
-    jaw = np.load(jaw_path).astype(np.float32)     # [T, 6]
-    expr = expr.reshape(expr.shape[0], -1)
-    jaw = jaw.reshape(jaw.shape[0], -1)
-    T = min(len(expr), len(jaw))
-    if len(expr) != len(jaw):
-        print(f"[!] expr ({len(expr)}) and jaw ({len(jaw)}) lengths differ; truncating to {T}.")
-    targets = np.concatenate([expr[:T], jaw[:T]], axis=-1)
-    return targets
+def build_targets(args) -> np.ndarray:
+    if args.frames_dir:
+        print(f"Loading targets from {args.frames_dir}")
+        return load_targets_from_frames(args.frames_dir)
+    if not args.eyelids:
+        raise ValueError(
+            "NPY mode requires --eyelids. Use --frames_dir for Metrical .frame files."
+        )
+    return build_targets_from_npy(args.expr, args.jaw, args.eyelids)
 
 
 def temporal_split(n_frames, win_frames, stride, val_frac, gap_frames):
@@ -124,11 +122,12 @@ def temporal_split(n_frames, win_frames, stride, val_frac, gap_frames):
 # Evaluation
 # ---------------------------------------------------------------------------
 @torch.no_grad()
-def evaluate(model, loader, criterion, device, expr_dim, std):
+def evaluate(model, loader, criterion, device, expr_dim, eyelid_dim, std):
     model.eval()
     total_loss = 0.0
-    mae_expr_sum, mae_jaw_sum, n = 0.0, 0.0, 0
+    mae_expr_sum, mae_eyelids_sum, mae_jaw_sum, n = 0.0, 0.0, 0.0, 0
     std_t = torch.as_tensor(std, dtype=torch.float32, device=device)
+    jaw_start = expr_dim + eyelid_dim
     for audio, target in loader:
         audio = audio.to(device)
         target = target.to(device)
@@ -136,12 +135,17 @@ def evaluate(model, loader, criterion, device, expr_dim, std):
         loss, _ = criterion(pred, target)
         total_loss += loss.item()
 
-        # Per-component MAE in original (un-normalized) units.
         diff = (pred - target).abs() * std_t
         mae_expr_sum += diff[..., :expr_dim].mean().item()
-        mae_jaw_sum += diff[..., expr_dim:].mean().item()
+        mae_eyelids_sum += diff[..., expr_dim:jaw_start].mean().item()
+        mae_jaw_sum += diff[..., jaw_start:].mean().item()
         n += 1
-    return total_loss / max(1, n), mae_expr_sum / max(1, n), mae_jaw_sum / max(1, n)
+    return (
+        total_loss / max(1, n),
+        mae_expr_sum / max(1, n),
+        mae_eyelids_sum / max(1, n),
+        mae_jaw_sum / max(1, n),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -154,12 +158,16 @@ def train(args):
     print(f"Device: {device}")
 
     # --- data ---
-    targets = build_targets(args.expr, args.jaw)        # [T, 106]
-    expr_arr = np.load(args.expr)
-    expr_dim = int(expr_arr.reshape(expr_arr.shape[0], -1).shape[1])
+    targets = build_targets(args)                       # [T, 108]
+    expr_dim = EXPR_DIM
+    eyelid_dim = EYELID_DIM
+    jaw_dim = JAW_DIM
     out_dim = targets.shape[1]
     n_frames = targets.shape[0]
-    print(f"Frames: {n_frames} | target dim: {out_dim} (expr={expr_dim}, jaw={out_dim - expr_dim})")
+    print(
+        f"Frames: {n_frames} | target dim: {out_dim} "
+        f"(expr={expr_dim}, eyelids={eyelid_dim}, jaw={jaw_dim})"
+    )
 
     wav = load_audio(args.audio, SR)
     expected = samples_for_frames(n_frames, args.fps, SR)
@@ -187,7 +195,15 @@ def train(args):
     std = targets[train_frame_mask].std(axis=0)
     std = np.where(std < 1e-6, 1.0, std).astype(np.float32)
     mean = mean.astype(np.float32)
-    np.savez(args.stats_out, mean=mean, std=std, expr_dim=expr_dim, fps=args.fps)
+    np.savez(
+        args.stats_out,
+        mean=mean,
+        std=std,
+        expr_dim=expr_dim,
+        eyelid_dim=eyelid_dim,
+        jaw_dim=jaw_dim,
+        fps=args.fps,
+    )
     print(f"Saved normalization stats -> {args.stats_out}")
 
     targets_norm = torch.from_numpy((targets - mean) / std).float()
@@ -210,12 +226,23 @@ def train(args):
 
     # --- model / optim ---
     model = Audio2Flame(
-        out_dim=out_dim, d_model=args.d_model, n_layers=args.n_layers,
-        w2v_name=args.w2v_name, freeze_feature_extractor=True,
+        out_dim=out_dim,
+        bilstm_hidden=args.bilstm_hidden,
+        bilstm_layers=args.bilstm_layers,
+        mlp_hidden=args.mlp_hidden,
+        dropout=args.dropout,
+        w2v_name=args.w2v_name,
     ).to(device)
-    criterion = SmoothFlameLoss(expr_dim=expr_dim, w_jaw=args.w_jaw, w_vel=args.w_vel)
+    criterion = SmoothFlameLoss(
+        expr_dim=expr_dim,
+        eyelid_dim=eyelid_dim,
+        w_eyelids=args.w_eyelids,
+        w_jaw=args.w_jaw,
+        w_vel=args.w_vel,
+    )
     optimizer = torch.optim.AdamW(
-        model.param_groups(backbone_lr=args.backbone_lr, head_lr=args.head_lr),
+        model.parameters(),
+        lr=args.lr,
         weight_decay=args.weight_decay,
     )
 
@@ -255,17 +282,23 @@ def train(args):
             scheduler.step()
 
             running += loss.item()
-            pbar.set_postfix(loss=f"{loss.item():.4f}",
-                             jaw=f"{comps['jaw'].item():.4f}")
+            pbar.set_postfix(
+                loss=f"{loss.item():.4f}",
+                jaw=f"{comps['jaw'].item():.4f}",
+                eyelids=f"{comps['eyelids'].item():.4f}",
+            )
 
         train_loss = running / max(1, len(train_loader))
 
         if val_loader is not None:
-            val_loss, mae_expr, mae_jaw = evaluate(
-                model, val_loader, criterion, device, expr_dim, std
+            val_loss, mae_expr, mae_eyelids, mae_jaw = evaluate(
+                model, val_loader, criterion, device, expr_dim, eyelid_dim, std
             )
-            print(f"Epoch {epoch:03d} | train {train_loss:.5f} | val {val_loss:.5f} "
-                  f"| MAE expr {mae_expr:.4f} | MAE jaw {mae_jaw:.4f}")
+            print(
+                f"Epoch {epoch:03d} | train {train_loss:.5f} | val {val_loss:.5f} "
+                f"| MAE expr {mae_expr:.4f} | MAE eyelids {mae_eyelids:.4f} "
+                f"| MAE jaw {mae_jaw:.4f}"
+            )
             current = val_loss
         else:
             print(f"Epoch {epoch:03d} | train {train_loss:.5f}")
@@ -280,6 +313,8 @@ def train(args):
                     "args": vars(args),
                     "out_dim": out_dim,
                     "expr_dim": expr_dim,
+                    "eyelid_dim": eyelid_dim,
+                    "jaw_dim": jaw_dim,
                 },
                 args.ckpt_out,
             )
@@ -298,7 +333,9 @@ def parse_args():
     p = argparse.ArgumentParser(description="Per-subject Audio2FLAME trainer")
     # data
     p.add_argument("--audio", required=True, help="WAV synced to frame 0 of tracking")
+    p.add_argument("--frames_dir", default="", help="Directory of Metrical .frame files")
     p.add_argument("--expr", default="expressions_x.npy")
+    p.add_argument("--eyelids", default="", help="Eyelids npy (required if not using --frames_dir)")
     p.add_argument("--jaw", default="jaw_x.npy")
     p.add_argument("--fps", type=int, default=30)
     p.add_argument("--win_sec", type=float, default=4.0)
@@ -306,16 +343,18 @@ def parse_args():
     p.add_argument("--val_frac", type=float, default=0.15)
     # model
     p.add_argument("--w2v_name", default="facebook/wav2vec2-base-960h")
-    p.add_argument("--d_model", type=int, default=512)
-    p.add_argument("--n_layers", type=int, default=6)
+    p.add_argument("--bilstm_hidden", type=int, default=256)
+    p.add_argument("--bilstm_layers", type=int, default=2)
+    p.add_argument("--mlp_hidden", type=int, default=256)
+    p.add_argument("--dropout", type=float, default=0.1)
     # loss
+    p.add_argument("--w_eyelids", type=float, default=1.0)
     p.add_argument("--w_jaw", type=float, default=2.0)
     p.add_argument("--w_vel", type=float, default=2.0)
     # optim
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--batch_size", type=int, default=8)
-    p.add_argument("--backbone_lr", type=float, default=1e-5)
-    p.add_argument("--head_lr", type=float, default=1e-4)
+    p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--warmup_frac", type=float, default=0.05)
     p.add_argument("--grad_clip", type=float, default=1.0)
