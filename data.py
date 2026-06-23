@@ -10,6 +10,8 @@ import torch
 
 from model import EYELID_DIM, EXPR_DIM, JAW_DIM
 
+EYES_DIM = 12
+
 
 def load_frame(path: str):
     try:
@@ -40,18 +42,21 @@ def _frame_sort_key(path: str) -> int:
     return 0
 
 
+def _sorted_frame_paths(frames_dir: str) -> list[str]:
+    pattern = os.path.join(frames_dir, "*.frame")
+    paths = sorted(glob.glob(pattern), key=_frame_sort_key)
+    if not paths:
+        raise FileNotFoundError(f"No .frame files found in {frames_dir}")
+    return paths
+
+
 def load_targets_from_frames(frames_dir: str) -> np.ndarray:
     """Load exp, eyelids, and jaw from Metrical tracker .frame files.
 
     Returns [T, EXPR_DIM + EYELID_DIM + JAW_DIM] float32 array.
     """
-    pattern = os.path.join(frames_dir, "*.frame")
-    paths = sorted(glob.glob(pattern), key=_frame_sort_key)
-    if not paths:
-        raise FileNotFoundError(f"No .frame files found in {frames_dir}")
-
     rows = []
-    for path in paths:
+    for path in _sorted_frame_paths(frames_dir):
         flame = _flame_dict(load_frame(path))
         exp = to_numpy(flame["exp"]).reshape(-1).astype(np.float32)
         eyelids = to_numpy(flame["eyelids"]).reshape(-1).astype(np.float32)
@@ -65,6 +70,25 @@ def load_targets_from_frames(frames_dir: str) -> np.ndarray:
         rows.append(np.concatenate([exp, eyelids, jaw], axis=0))
 
     return np.stack(rows, axis=0)
+
+
+def load_eyes_from_frames(frames_dir: str) -> np.ndarray:
+    """Load per-frame eye pose from Metrical .frame files. Returns [T, EYES_DIM]."""
+    rows = []
+    for path in _sorted_frame_paths(frames_dir):
+        flame = _flame_dict(load_frame(path))
+        eyes = to_numpy(flame["eyes"]).reshape(-1).astype(np.float32)
+        if eyes.shape[0] != EYES_DIM:
+            raise ValueError(f"{path}: expected eyes dim {EYES_DIM}, got {eyes.shape[0]}")
+        rows.append(eyes)
+    return np.stack(rows, axis=0)
+
+
+def load_eyes_from_npy(eyes_path: str, n_frames: int) -> np.ndarray:
+    eyes = np.load(eyes_path).astype(np.float32).reshape(-1, EYES_DIM)
+    if len(eyes) < n_frames:
+        raise ValueError(f"eyes npy has {len(eyes)} frames, expected {n_frames}")
+    return eyes[:n_frames]
 
 
 def build_targets_from_npy(expr_path: str, jaw_path: str, eyelids_path: str) -> np.ndarray:

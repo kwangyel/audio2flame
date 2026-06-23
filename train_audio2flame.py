@@ -1,21 +1,16 @@
 """
 Per-subject Audio2FLAME training.
 
-Regresses FLAME exp[100] + eyelids[2] + jaw[6] from raw audio using a frozen
-Wav2Vec2 encoder, 2-layer BiLSTM, and MLP head. Trains on short windows of a
-single subject's synchronized (audio, FLAME-tracking) recording.
-
-Inputs:
-  --audio       a single WAV synced to frame 0 of the tracking
-  --frames_dir  directory of Metrical .frame files (preferred)
-  or --expr / --eyelids / --jaw npy files
-
-Outputs:
-  audio2flame_best.pth   best checkpoint (by temporal validation loss)
-  flame_stats.npz        per-channel target mean/std (for un-normalization)
+Regresses FLAME exp[100] + eyelids[2] + jaw[6] from raw audio using a partially
+fine-tuned Wav2Vec2 encoder, 2-layer BiLSTM (before fps align), and separate MLP
+heads. Optional metrical FLAME lip vertex loss.
 
 Example:
-  python train_audio2flame.py --audio subject.wav --frames_dir combined/ --fps 30
+  python train_audio2flame.py --audio subject.wav --frames_dir combined/ \
+      --ref_frame combined/00000.frame \
+      --metrical_repo /path/to/metrical-tracker-parallel \
+      --flame_dir /path/to/metrical-tracker-parallel/data/FLAME2020 \
+      --fps 30 --epochs 100
 """
 
 import argparse
@@ -26,7 +21,12 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from data import build_targets_from_npy, load_targets_from_frames
+from data import (
+    build_targets_from_npy,
+    load_eyes_from_frames,
+    load_eyes_from_npy,
+    load_targets_from_frames,
+)
 from model import Audio2Flame, EYELID_DIM, EXPR_DIM, JAW_DIM, SmoothFlameLoss
 
 SR = 16000
@@ -62,13 +62,13 @@ def samples_for_frames(n_frames: int, fps: int, sr: int = SR) -> int:
 class Audio2FlameWindows(Dataset):
     """Sliding windows over a single recording.
 
-    Returns (waveform_window, normalized_target_window). All audio windows share
-    a fixed sample length so they collate into a batch directly.
+    Returns (waveform_window, normalized_target_window, eyes_window).
     """
 
-    def __init__(self, wav, targets_norm, start_frames, win_frames, fps, sr=SR):
+    def __init__(self, wav, targets_norm, eyes, start_frames, win_frames, fps, sr=SR):
         self.wav = wav
         self.targets = targets_norm
+        self.eyes = eyes
         self.start_frames = start_frames
         self.win_frames = win_frames
         self.fps = fps
@@ -85,12 +85,13 @@ class Audio2FlameWindows(Dataset):
         a0 = samples_for_frames(f0, self.fps, self.sr)
         a1 = a0 + self.win_samples
         audio = self.wav[a0:a1]
-        if audio.shape[0] < self.win_samples:        # pad the final window
+        if audio.shape[0] < self.win_samples:
             audio = F.pad(audio, (0, self.win_samples - audio.shape[0]))
         audio = normalize_waveform(audio)
 
         target = self.targets[f0:f1]
-        return audio, target
+        eyes_win = self.eyes[f0:f1]
+        return audio, target, eyes_win
 
 
 # ---------------------------------------------------------------------------
@@ -107,15 +108,44 @@ def build_targets(args) -> np.ndarray:
     return build_targets_from_npy(args.expr, args.jaw, args.eyelids)
 
 
+def build_eyes(args, n_frames: int) -> np.ndarray:
+    if args.frames_dir:
+        print(f"Loading eyes from {args.frames_dir}")
+        return load_eyes_from_frames(args.frames_dir)
+    if args.eyes:
+        return load_eyes_from_npy(args.eyes, n_frames)
+    print("[!] No eyes data found; using zeros for lip-loss eye context.")
+    return np.zeros((n_frames, 12), dtype=np.float32)
+
+
 def temporal_split(n_frames, win_frames, stride, val_frac, gap_frames):
-    """Split frame timeline into non-overlapping train / val regions, then make
-    window start indices within each region so no window crosses the boundary."""
+    """Split frame timeline into non-overlapping train / val regions."""
     train_end = int(n_frames * (1.0 - val_frac))
     val_start = min(n_frames, train_end + gap_frames)
 
     train_starts = list(range(0, max(0, train_end - win_frames) + 1, stride))
     val_starts = list(range(val_start, max(val_start, n_frames - win_frames) + 1, stride))
     return train_starts, val_starts, train_end, val_start
+
+
+def build_lip_loss(args, device):
+    if args.w_lip <= 0:
+        return None
+    if not args.metrical_repo or not args.flame_dir or not args.ref_frame:
+        raise ValueError(
+            "Lip loss requires --metrical_repo, --flame_dir, and --ref_frame "
+            "(or set --w_lip 0 to disable)."
+        )
+    from flame_loss import FlameLipLoss
+
+    lip_loss = FlameLipLoss(
+        metrical_repo=args.metrical_repo,
+        flame_dir=args.flame_dir,
+        ref_frame=args.ref_frame,
+        flame_lmk=args.flame_lmk,
+    ).to(device)
+    print("Enabled FLAME lip vertex loss.")
+    return lip_loss
 
 
 # ---------------------------------------------------------------------------
@@ -128,7 +158,7 @@ def evaluate(model, loader, criterion, device, expr_dim, eyelid_dim, std):
     mae_expr_sum, mae_eyelids_sum, mae_jaw_sum, n = 0.0, 0.0, 0.0, 0
     std_t = torch.as_tensor(std, dtype=torch.float32, device=device)
     jaw_start = expr_dim + eyelid_dim
-    for audio, target in loader:
+    for audio, target, _eyes in loader:
         audio = audio.to(device)
         target = target.to(device)
         pred = model(audio, target.shape[1])
@@ -157,8 +187,7 @@ def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    # --- data ---
-    targets = build_targets(args)                       # [T, 108]
+    targets = build_targets(args)
     expr_dim = EXPR_DIM
     eyelid_dim = EYELID_DIM
     jaw_dim = JAW_DIM
@@ -168,6 +197,14 @@ def train(args):
         f"Frames: {n_frames} | target dim: {out_dim} "
         f"(expr={expr_dim}, eyelids={eyelid_dim}, jaw={jaw_dim})"
     )
+
+    eyes = build_eyes(args, n_frames)
+    if len(eyes) != n_frames:
+        n = min(len(eyes), n_frames)
+        print(f"[!] eyes ({len(eyes)}) and targets ({n_frames}) differ; truncating to {n}.")
+        eyes = eyes[:n]
+        targets = targets[:n]
+        n_frames = n
 
     wav = load_audio(args.audio, SR)
     expected = samples_for_frames(n_frames, args.fps, SR)
@@ -188,7 +225,6 @@ def train(args):
     print(f"Train region: [0, {train_end}) -> {len(train_starts)} windows")
     print(f"Val region:   [{val_start}, {n_frames}) -> {len(val_starts)} windows")
 
-    # --- normalization (train frames only) ---
     train_frame_mask = np.zeros(n_frames, dtype=bool)
     train_frame_mask[:train_end] = True
     mean = targets[train_frame_mask].mean(axis=0)
@@ -207,24 +243,25 @@ def train(args):
     print(f"Saved normalization stats -> {args.stats_out}")
 
     targets_norm = torch.from_numpy((targets - mean) / std).float()
+    eyes_t = torch.from_numpy(eyes).float()
+    mean_t = torch.from_numpy(mean).float().to(device)
+    std_t = torch.from_numpy(std).float().to(device)
 
-    train_ds = Audio2FlameWindows(wav, targets_norm, train_starts, win_frames, args.fps)
+    train_ds = Audio2FlameWindows(wav, targets_norm, eyes_t, train_starts, win_frames, args.fps)
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True, drop_last=False,
         num_workers=args.num_workers, pin_memory=(device.type == "cuda"),
     )
     val_loader = None
     if val_starts:
-        val_ds = Audio2FlameWindows(wav, targets_norm, val_starts, win_frames, args.fps)
+        val_ds = Audio2FlameWindows(wav, targets_norm, eyes_t, val_starts, win_frames, args.fps)
         val_loader = DataLoader(
             val_ds, batch_size=args.batch_size, shuffle=False,
             num_workers=args.num_workers, pin_memory=(device.type == "cuda"),
         )
     else:
-        print("[!] No validation windows (recording too short for the split). "
-              "Checkpoints will be saved on training loss.")
+        print("[!] No validation windows. Checkpoints will be saved on training loss.")
 
-    # --- model / optim ---
     model = Audio2Flame(
         out_dim=out_dim,
         bilstm_hidden=args.bilstm_hidden,
@@ -239,10 +276,12 @@ def train(args):
         w_eyelids=args.w_eyelids,
         w_jaw=args.w_jaw,
         w_vel=args.w_vel,
+        w_acc=args.w_acc,
     )
+    lip_loss = build_lip_loss(args, device)
+
     optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
+        model.param_groups(w2v_lr=args.w2v_lr, head_lr=args.head_lr),
         weight_decay=args.weight_decay,
     )
 
@@ -265,14 +304,20 @@ def train(args):
         model.train()
         running = 0.0
         pbar = tqdm(train_loader, desc=f"Epoch {epoch:03d}/{args.epochs}", leave=False)
-        for audio, target in pbar:
+        for audio, target, eyes in pbar:
             audio = audio.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
+            eyes = eyes.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=use_amp):
                 pred = model(audio, target.shape[1])
                 loss, comps = criterion(pred, target)
+
+            if lip_loss is not None:
+                loss_lip = lip_loss(pred.float(), target.float(), eyes.float(), mean_t, std_t)
+                loss = loss + args.w_lip * loss_lip
+                comps["lip"] = loss_lip.detach()
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -282,17 +327,20 @@ def train(args):
             scheduler.step()
 
             running += loss.item()
-            pbar.set_postfix(
-                loss=f"{loss.item():.4f}",
-                jaw=f"{comps['jaw'].item():.4f}",
-                eyelids=f"{comps['eyelids'].item():.4f}",
-            )
+            postfix = {
+                "loss": f"{loss.item():.4f}",
+                "jaw": f"{comps['jaw'].item():.4f}",
+                "acc": f"{comps['acc'].item():.4f}",
+            }
+            if "lip" in comps:
+                postfix["lip"] = f"{comps['lip'].item():.4f}"
+            pbar.set_postfix(postfix)
 
         train_loss = running / max(1, len(train_loader))
 
         if val_loader is not None:
             val_loss, mae_expr, mae_eyelids, mae_jaw = evaluate(
-                model, val_loader, criterion, device, expr_dim, eyelid_dim, std
+                model, val_loader, criterion, device, expr_dim, eyelid_dim, std,
             )
             print(
                 f"Epoch {epoch:03d} | train {train_loss:.5f} | val {val_loss:.5f} "
@@ -337,6 +385,7 @@ def parse_args():
     p.add_argument("--expr", default="expressions_x.npy")
     p.add_argument("--eyelids", default="", help="Eyelids npy (required if not using --frames_dir)")
     p.add_argument("--jaw", default="jaw_x.npy")
+    p.add_argument("--eyes", default="", help="Eyes npy [T,12] for lip loss in npy mode")
     p.add_argument("--fps", type=int, default=30)
     p.add_argument("--win_sec", type=float, default=4.0)
     p.add_argument("--stride_sec", type=float, default=1.0)
@@ -351,10 +400,17 @@ def parse_args():
     p.add_argument("--w_eyelids", type=float, default=1.0)
     p.add_argument("--w_jaw", type=float, default=2.0)
     p.add_argument("--w_vel", type=float, default=2.0)
+    p.add_argument("--w_acc", type=float, default=1.0)
+    p.add_argument("--w_lip", type=float, default=1.0, help="0 disables FLAME lip vertex loss")
+    p.add_argument("--metrical_repo", default="", help="Path to metrical-tracker-parallel checkout")
+    p.add_argument("--flame_dir", default="", help="Path to FLAME2020/ (generic_model.pkl, masks)")
+    p.add_argument("--ref_frame", default="", help="Reference .frame for subject shape (lip loss)")
+    p.add_argument("--flame_lmk", default="", help="Optional FLAME landmark embedding path")
     # optim
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--batch_size", type=int, default=8)
-    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--w2v_lr", type=float, default=1e-5)
+    p.add_argument("--head_lr", type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--warmup_frac", type=float, default=0.05)
     p.add_argument("--grad_clip", type=float, default=1.0)

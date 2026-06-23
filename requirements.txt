@@ -4,3 +4,4 @@ transformers>=4.30
 numpy>=1.23
 tqdm>=4.65
 soundfile>=0.12
+pytorch3d>=0.7.0
